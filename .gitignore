@@ -1,0 +1,7 @@
+.venv/
+**/bin/
+**/obj/
+**/__pycache__/
+runtime/
+dist/
+tools/
