@@ -1,6 +1,6 @@
 import unittest
 from datetime import datetime, timezone
-from public_quotes import from_yahoo, from_robinhood, from_cnbc, choose
+from public_quotes import from_yahoo, from_robinhood, from_cnbc, choose, positive
 
 
 def at(value):
@@ -17,6 +17,11 @@ def fixture():
 
 
 class PublicQuoteTests(unittest.TestCase):
+    def test_price_filter_rejects_blank_nonfinite_and_nonpositive(self):
+        for bad in (None, '', 'abc', float('nan'), float('inf'), 0, -1):
+            self.assertIsNone(positive(bad), bad)
+        self.assertEqual(positive('396.42'), 396.42)
+
     def test_symbol_parameter_validates_upstream_identity(self):
         f = fixture(); f['chart']['result'][0]['meta']['symbol'] = 'NVDA'
         s = from_yahoo(f, at('2026-10-28T20:31:00'), symbol='NVDA')

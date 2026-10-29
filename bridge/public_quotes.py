@@ -1,9 +1,18 @@
 """Public WDC quote adapters. Source timestamps, not fetch time, identify trades."""
+import math
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from quotes import positive
 
 ET = ZoneInfo('America/New_York')
+
+
+def positive(value):
+    """A usable price, or None. Rejects zero, negatives, NaN and infinity."""
+    try:
+        value = float(value)
+        return value if math.isfinite(value) and value > 0 else None
+    except (ValueError, TypeError):
+        return None
 
 
 def session(now, meta=None):
