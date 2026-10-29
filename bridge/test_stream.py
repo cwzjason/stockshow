@@ -1,3 +1,5 @@
+import json
+from unittest.mock import patch
 import unittest
 from stream import decode, tick, merge, refresh_interval, Stream, backoff
 
@@ -68,9 +70,27 @@ class MergeTests(unittest.TestCase):
         quote = tick('{"type":"pricing","message":"%s"}' % WDC)
         self.assertIsNone(merge(dict(SNAPSHOT, quoteEpoch=quote['epoch'] + 60), quote))
 
-    def test_unavailable_snapshot_cannot_be_merged(self):
+    def test_push_fills_a_session_the_http_source_cannot_price(self):
+        # Yahoo's snapshot APIs stop at 20:00 ET and expose no overnight session, but the
+        # stream carries live overnight trades. Discarding them is what made the bar blank.
+        quote = tick('{"type":"pricing","message":"%s"}' % NVDA)
+        overnight = dict(SNAPSHOT, symbol='NVDA', session='夜盘', available=False, price=None,
+                         reference=None, changePercent=None, quoteEpoch=0)
+        merged = merge(overnight, quote)
+        self.assertIsNotNone(merged)
+        self.assertTrue(merged['available'])
+        self.assertAlmostEqual(merged['price'], 213.82, places=2)
+        self.assertAlmostEqual(merged['reference'], 215.38, places=2)
+
+    def test_filled_session_stays_overnight_not_rebuilt_from_the_push(self):
+        quote = tick('{"type":"pricing","message":"%s"}' % NVDA)
+        merged = merge(dict(SNAPSHOT, symbol='NVDA', session='夜盘', available=False,
+                            price=None, reference=None), quote)
+        self.assertEqual((merged['session'], merged['currency']), ('夜盘', 'USD'))
+
+    def test_unidentified_instrument_blocks_push_merge(self):
         quote = tick('{"type":"pricing","message":"%s"}' % WDC)
-        self.assertIsNone(merge(dict(SNAPSHOT, available=False, price=None), quote))
+        self.assertIsNone(merge(dict(SNAPSHOT, connected=False, available=False, price=None), quote))
 
     def test_merged_quote_reports_its_own_age(self):
         quote = tick('{"type":"pricing","message":"%s"}' % WDC)
@@ -97,6 +117,29 @@ class LifecycleTests(unittest.TestCase):
         stream = Stream(lambda quote: None)
         stream.stop()
         self.assertFalse(stream.running)
+
+    def test_dropped_symbol_is_unsubscribed_and_its_late_frames_ignored(self):
+        # When Longbridge takes over a symbol, Yahoo's copy of the same trade must stop
+        # overwriting it. Yahoo keeps old subscriptions unless told to unsubscribe.
+        seen, sent = [], []
+        stream = Stream(seen.append)
+
+        class FakeSocket:
+            calls = 0
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def send(self, text): sent.append(json.loads(text))
+            def recv(self, timeout):
+                FakeSocket.calls += 1
+                if FakeSocket.calls == 1: stream.subscribe(['NVDA'])
+                if FakeSocket.calls >= 3: stream.stop()
+                return '{"type":"pricing","message":"%s"}' % WDC
+
+        stream.symbols, stream.running = ['WDC'], True
+        with patch('stream.connect', lambda *a, **k: FakeSocket()):
+            stream._loop()
+        self.assertEqual(sent, [{'subscribe': ['WDC']}, {'unsubscribe': ['WDC']}, {'subscribe': ['NVDA']}])
+        self.assertEqual(seen, [])
 
 
 if __name__ == '__main__':

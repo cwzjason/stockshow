@@ -63,6 +63,7 @@ public static class SessionStyle
 public sealed class MarketFeed
 {
     public Dictionary<string, Snapshot> Quotes { get; init; } = new();
+    public Dictionary<string, string> Providers { get; init; } = new();
     public Snapshot ForSymbol(string symbol) => Quotes.TryGetValue(symbol, out var s) && s.Symbol == symbol ? s :
         new Snapshot { Symbol = symbol, Message = "正在获取 " + symbol + " 行情…" };
 }

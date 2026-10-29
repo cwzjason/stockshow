@@ -94,21 +94,34 @@ def tick(envelope):
 
 
 def merge(snapshot, pushed, now=None):
-    """Apply a pushed trade on top of an HTTP snapshot. Identity and session never change."""
+    """Apply a pushed trade on top of an HTTP snapshot.
+
+    The push may supply a price the HTTP source cannot: Yahoo's snapshot APIs stop at
+    20:00 ET and expose no overnight session, while the stream carries live overnight
+    trades. What a push may never supply is identity, session or currency -- those stay
+    HTTP-only, so a pushed trade cannot invent a session it was never told about. A
+    disconnected snapshot means the instrument was never identified, so it is refused.
+    The one exception is a broker push (Longbridge) that names its own session.
+    """
     if not snapshot or not pushed: return None
-    if snapshot.get('symbol') != pushed['symbol']: return None
-    if not snapshot.get('available') or not snapshot.get('price'): return None
+    if not snapshot.get('connected') or snapshot.get('symbol') != pushed['symbol']: return None
     if pushed['change'] is None: return None
     stamp = pushed['epoch']
     if stamp <= 0 or stamp < snapshot.get('quoteEpoch', 0): return None
+    reference = round(pushed['price'] - pushed['change'], 6)
+    percent = pushed['changePercent']
+    if percent is None and reference > 0:
+        percent = round((pushed['price'] / reference - 1) * 100, 4)
     age = max(0, int((now if now is not None else time.time()) - stamp))
     result = dict(snapshot)
-    result.update(price=pushed['price'], reference=round(pushed['price'] - pushed['change'], 6),
-                  changePercent=pushed['changePercent'], quoteEpoch=stamp,
-                  available=True, connected=True, source='Yahoo 实时推送',
+    result.update(price=pushed['price'],
+                  reference=reference if reference > 0 else snapshot.get('reference'),
+                  changePercent=percent, quoteEpoch=stamp,
+                  available=True, connected=True, source=pushed.get('source', 'Yahoo 实时推送'),
                   quoteTime=datetime.fromtimestamp(stamp, ET).strftime('%Y-%m-%d %H:%M:%S'),
                   fetchedAt=datetime.now(timezone.utc).isoformat(),
                   message='交易所推送的逐笔成交，非轮询。该笔成交距今 %d 秒。' % age)
+    if pushed.get('session'): result['session'] = pushed['session']
     return result
 
 
@@ -152,18 +165,24 @@ class Stream:
         while self.running:
             try:
                 with connect(self.url, open_timeout=10, ping_interval=15, ping_timeout=10) as ws:
-                    ws.send(json.dumps({'subscribe': self.symbols}))
+                    sent = list(self.symbols)
+                    ws.send(json.dumps({'subscribe': sent}))
                     attempt = 0
                     while self.running:
                         if self._pending:
                             self._pending = False
-                            ws.send(json.dumps({'subscribe': self.symbols}))
+                            # A shorter subscribe list does not cancel the old ones server-side.
+                            dropped = [s for s in sent if s not in self.symbols]
+                            if dropped: ws.send(json.dumps({'unsubscribe': dropped}))
+                            sent = list(self.symbols)
+                            ws.send(json.dumps({'subscribe': sent}))
                         try:
                             envelope = ws.recv(timeout=5)
                         except TimeoutError:
                             continue
                         pushed = tick(envelope)
-                        if pushed:
+                        # Late frames for a dropped symbol must not override a better feed.
+                        if pushed and pushed['symbol'] in self.symbols:
                             try: self.on_quote(pushed)
                             except Exception: pass
             except Exception:

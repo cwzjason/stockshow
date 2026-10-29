@@ -25,6 +25,9 @@ Check(WatchlistParser.Parse("603004.SH\nBTC.CC\nUS10Y.BD\nCLmain.US").SequenceEq
 Check(WatchlistParser.Parse("../../bad\n396.42\n名称").Count == 0, "invalid entries do not become requests");
 var feed = new MarketFeed { Quotes = new() { ["NVDA"] = new Snapshot { Symbol = "WDC", Price = 100 } } };
 Check(!feed.ForSymbol("NVDA").HasPrice, "wrong-symbol response cannot display a quote");
+var withBroker = JsonSerializer.Deserialize<MarketFeed>("{\"quotes\":{},\"providers\":{\"longbridge\":\"已连接\"}}", Snapshot.JsonOptions)!;
+Check(withBroker.Providers["longbridge"] == "已连接", "broker status reaches the UI");
+Check(JsonSerializer.Deserialize<MarketFeed>("{\"quotes\":{}}", Snapshot.JsonOptions)!.Providers.Count == 0, "older feed without providers still loads");
 Check((s with { Currency = "KRW", Price = 242000 }).DisplayPrice == "₩242,000", "foreign prices never labeled dollars");
 Console.WriteLine($"PASS {count} total checks");
 var live = SessionStyle.For("盘中");

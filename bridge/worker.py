@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 from public_quotes import from_yahoo, from_robinhood, from_cnbc, choose
 from stream import Stream, merge, refresh_interval
+from longbridge_feed import LongbridgeFeed, load_credentials
 
 
 def valid_symbol(symbol):
@@ -105,10 +106,16 @@ def with_note(snapshot, note):
 
 
 def apply_push(quotes, last_push, pushed_at, pushed, now):
-    """Fold a pushed trade into the cached quote. Only a real merge counts as coverage."""
+    """Fold a pushed trade into the cached quote. Only a real merge counts as coverage.
+
+    The trade is kept even when no HTTP snapshot exists yet: a broker's first push
+    arrives before the first HTTP response and is merged once that response lands.
+    """
+    previous = last_push.get(pushed['symbol'])
+    if not previous or pushed['epoch'] >= previous['epoch']:
+        last_push[pushed['symbol']] = pushed
     merged = merge(quotes.get(pushed['symbol']), pushed)
     if not merged: return None
-    last_push[pushed['symbol']] = pushed
     pushed_at[pushed['symbol']] = now
     quotes[pushed['symbol']] = merged
     return merged
@@ -137,10 +144,19 @@ def run(path, once=False, symbols=None, owner=0):
             except Exception as exc: quotes[symbol] = unavailable(symbol, {}, str(exc))
         write_snapshot(path, {'quotes': quotes})
         return
-    write_snapshot(path, {'quotes': {}})
     ticks = queue.SimpleQueue()
     last_push, pushed_at = {}, {}
     stream = Stream(ticks.put)
+    broker, credentials, checked = None, None, -1e9
+    held = []
+    providers = {'longbridge': '未配置'}
+
+    def publish():
+        write_snapshot(path, {'quotes': quotes, 'providers': providers})
+
+    def log(message): print(message, flush=True)
+
+    publish()
     with ThreadPoolExecutor(max_workers=2) as pool:
         pending = {}
         try:
@@ -150,16 +166,29 @@ def run(path, once=False, symbols=None, owner=0):
                 config = read_json(root / 'watchlist.json', {})
                 unsupported = config.get('unsupported', {})
                 notes = config.get('notes', {})
-                stream.subscribe([s for s in (request.get('symbol'), request.get('nextSymbol')) if valid_symbol(s)])
                 now = time.monotonic()
-                changed = False
-                while not ticks.empty():
-                    pushed = ticks.get()
+                active = [s for s in (request.get('symbol'), request.get('nextSymbol')) if valid_symbol(s)]
+                # Credentials are re-read every few seconds, so pasting a key needs no restart.
+                if now - checked >= 3:
+                    checked = now
+                    found = load_credentials(root / 'runtime' / 'longbridge.json')
+                    if found != credentials:
+                        if broker: broker.stop()
+                        credentials = found
+                        broker = LongbridgeFeed(ticks.put, found, log) if found else None
+                        if broker: broker.start(active)
+                if broker: broker.subscribe(active)
+                changed = providers.get('longbridge') != (broker.status if broker else '未配置')
+                providers['longbridge'] = broker.status if broker else '未配置'
+                # The broker push is the better feed; Yahoo only streams what it does not cover.
+                stream.subscribe([s for s in active if not (broker and broker.covers(s))])
+                while held or not ticks.empty():
+                    pushed = held.pop() if held else ticks.get()
                     if apply_push(quotes, last_push, pushed_at, pushed, now) is None: continue
                     symbol = pushed['symbol']
                     quotes[symbol] = with_note(quotes[symbol], notes.get(symbol))
                     changed = True
-                if changed: write_snapshot(path, {'quotes': quotes})
+                if changed: publish()
                 intervals = {s: refresh_interval(s, pushed_at, now)
                              for s in (request.get('symbol'), request.get('nextSymbol')) if valid_symbol(s)}
                 for symbol in due_symbols(request, attempted, now, intervals):
@@ -168,7 +197,7 @@ def run(path, once=False, symbols=None, owner=0):
                         quotes[symbol] = dict(symbol=symbol, connected=True, available=False, session='不支持',
                             message=unsupported[symbol], fetchedAt=datetime.now(timezone.utc).isoformat())
                         attempted[symbol] = now
-                        write_snapshot(path, {'quotes': quotes})
+                        publish()
                     elif len(pending) < 2:
                         attempted[symbol] = now
                         pending[pool.submit(fetch_snapshot, symbol)] = symbol
@@ -177,17 +206,20 @@ def run(path, once=False, symbols=None, owner=0):
                     symbol = pending.pop(task)
                     try: fresh = task.result()
                     except Exception as exc: fresh = unavailable(symbol, quotes.get(symbol, {}), str(exc))
-                    # A pushed trade newer than the HTTP response wins, but session and
-                    # currency always come from the HTTP snapshot.
+                    # A pushed trade newer than the HTTP response wins. Currency always
+                    # comes from HTTP; session too, unless a broker push named it.
                     pushed = last_push.get(symbol)
                     if pushed and pushed['epoch'] >= fresh.get('quoteEpoch', 0):
                         fresh = merge(fresh, pushed) or fresh
                     quotes[symbol] = with_note(fresh, notes.get(symbol))
                     attempted[symbol] = time.monotonic() + (12 if not quotes[symbol].get('connected') else 0)
-                    write_snapshot(path, {'quotes': quotes})
-                time.sleep(.1)
+                    publish()
+                # Wake the moment a push arrives instead of sleeping a fixed tick.
+                try: held.append(ticks.get(timeout=.1))
+                except queue.Empty: pass
         finally:
             stream.stop()
+            if broker: broker.stop()
 
 
 if __name__ == '__main__':
